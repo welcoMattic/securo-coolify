@@ -1,0 +1,169 @@
+# Docker Compose adapté pour un déploiement Coolify de Securo
+# Images officielles depuis ghcr.io/securo-finance, version épinglée.
+# Coolify injecte automatiquement les magic vars SERVICE_PASSWORD_*, SERVICE_URL_* et SERVICE_FQDN_*
+# (secrets générés, URL publique, routage proxy). Voir README.md.
+
+x-backend-env: &backend-env
+  # Base de données PostgreSQL (pgvector requis par les migrations depuis la 0.11.0)
+  DATABASE_URL: postgresql+asyncpg://postgres:${SERVICE_PASSWORD_POSTGRES}@db:5432/securo
+  # Clé secrète du backend, générée automatiquement par Coolify
+  SECRET_KEY: ${SERVICE_PASSWORD_64_SECRETKEY}
+  DEBUG: "false"
+  # URL publique du frontend, dérivée du domaine défini sur le service frontend
+  FRONTEND_URL: ${SERVICE_URL_FRONTEND}
+  # Pluggy (agrégation bancaire, Amérique latine)
+  PLUGGY_CLIENT_ID: ${PLUGGY_CLIENT_ID:-}
+  PLUGGY_CLIENT_SECRET: ${PLUGGY_CLIENT_SECRET:-}
+  PLUGGY_OAUTH_REDIRECT_URI: ${PLUGGY_OAUTH_REDIRECT_URI:-}
+  # Enable Banking (agrégation bancaire européenne, PSD2)
+  # ENABLE_BANKING_PRIVATE_KEY remplace le bind mount ./secrets upstream : PEM brut, \n échappés
+  ENABLE_BANKING_APP_ID: ${ENABLE_BANKING_APP_ID:-}
+  ENABLE_BANKING_PRIVATE_KEY: ${ENABLE_BANKING_PRIVATE_KEY:-}
+  ENABLE_BANKING_OAUTH_REDIRECT_URI: ${ENABLE_BANKING_OAUTH_REDIRECT_URI:-}
+  ENABLE_BANKING_API_URL: ${ENABLE_BANKING_API_URL:-https://api.enablebanking.com}
+  # SimpleFIN (agrégation bancaire US)
+  SIMPLEFIN_ENABLED: ${SIMPLEFIN_ENABLED:-false}
+  SIMPLEFIN_API_URL: ${SIMPLEFIN_API_URL:-https://beta-bridge.simplefin.org}
+  # OpenID Connect pour l'authentification externe
+  OIDC_ENABLED: ${OIDC_ENABLED:-false}
+  OIDC_PROVIDER_NAME: ${OIDC_PROVIDER_NAME:-OIDC}
+  OIDC_DISCOVERY_URL: ${OIDC_DISCOVERY_URL:-}
+  OIDC_CLIENT_ID: ${OIDC_CLIENT_ID:-}
+  OIDC_CLIENT_SECRET: ${OIDC_CLIENT_SECRET:-}
+  OIDC_REDIRECT_URI: ${OIDC_REDIRECT_URI:-}
+  OIDC_SCOPES: ${OIDC_SCOPES:-openid email profile}
+  OIDC_AUTO_REGISTER: ${OIDC_AUTO_REGISTER:-true}
+  OIDC_EXISTING_USER_LINK_MODE: ${OIDC_EXISTING_USER_LINK_MODE:-disabled}
+  OIDC_REQUIRE_VERIFIED_EMAIL: ${OIDC_REQUIRE_VERIFIED_EMAIL:-true}
+  OIDC_SYNC_ROLES: ${OIDC_SYNC_ROLES:-false}
+  OIDC_ROLES_CLAIM: ${OIDC_ROLES_CLAIM:-groups}
+  OIDC_ADMIN_ROLES: ${OIDC_ADMIN_ROLES:-}
+  OIDC_WORKSPACE_ROLE_MAP: ${OIDC_WORKSPACE_ROLE_MAP:-}
+  # Authentification locale (inscription et connexion via l'UI)
+  LOCAL_AUTH_ENABLED: ${LOCAL_AUTH_ENABLED:-true}
+  # Taux de change (Open Exchange Rates)
+  OPENEXCHANGERATES_APP_ID: ${OPENEXCHANGERATES_APP_ID:-}
+  FX_SYNC_MODE: ${FX_SYNC_MODE:-on_demand}
+  # Obligations du Trésor brésilien (inutile ici)
+  TESOURO_DIRETO_ENABLED: ${TESOURO_DIRETO_ENABLED:-false}
+  # Passkeys (WebAuthn) : laisser vide pour suivre le domaine du navigateur
+  WEBAUTHN_RP_ID: ${WEBAUTHN_RP_ID:-}
+  WEBAUTHN_RP_NAME: ${WEBAUTHN_RP_NAME:-Securo}
+  # Sauts de proxy de confiance : coolify-proxy (Traefik) + nginx du frontend = 2
+  TRUSTED_PROXY_HOPS: ${TRUSTED_PROXY_HOPS:-2}
+  # Redis : cache applicatif et broker Celery
+  REDIS_URL: redis://redis:6379/0
+  # Stockage local des pièces jointes
+  STORAGE_LOCAL_PATH: /app/data/attachments
+  AGENTS_KNOWLEDGE_STORAGE_PATH: /app/data/agent_knowledge
+  # Agents IA désactivés (service mcp-server upstream non inclus)
+  AGENTS_ENABLED: "false"
+
+services:
+  # Redis
+  redis:
+    image: redis:8-alpine
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # PostgreSQL 16 avec extension pgvector (majeure épinglée volontairement)
+  db:
+    image: pgvector/pgvector:pg16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${SERVICE_PASSWORD_POSTGRES}
+      POSTGRES_DB: securo
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # Backend Securo (FastAPI). Les migrations Alembic tournent au démarrage.
+  backend:
+    image: ghcr.io/securo-finance/securo-backend:${SECURO_VERSION:-0.15.1}
+    environment: *backend-env
+    command: sh -c "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - attachments:/app/data/attachments
+      - agent_knowledge:/app/data/agent_knowledge
+      - agent_embedding_models:/app/data/embedding_models
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 60s
+
+  # Frontend Securo (nginx + SPA, proxifie /api vers le backend)
+  # Seul service exposé : le domaine se définit dessus dans Coolify
+  frontend:
+    image: ghcr.io/securo-finance/securo-frontend:${SECURO_VERSION:-0.15.1}
+    environment:
+      # Déclare le routage Coolify vers le port 8080 de ce service
+      - SERVICE_FQDN_FRONTEND_8080
+      - BACKEND_URL=http://backend:8000
+      # URL https complète auto-remplie par Coolify
+      - FRONTEND_URL=${SERVICE_URL_FRONTEND}
+    depends_on:
+      backend:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # Worker Celery (synchronisations bancaires, tâches asynchrones)
+  celery-worker:
+    image: ghcr.io/securo-finance/securo-backend:${SECURO_VERSION:-0.15.1}
+    environment: *backend-env
+    command: celery -A app.worker worker --loglevel=info --concurrency=2
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - attachments:/app/data/attachments
+      - agent_knowledge:/app/data/agent_knowledge
+      - agent_embedding_models:/app/data/embedding_models
+    restart: unless-stopped
+
+  # Scheduler Celery (tâches périodiques)
+  celery-beat:
+    image: ghcr.io/securo-finance/securo-backend:${SECURO_VERSION:-0.15.1}
+    environment: *backend-env
+    command: celery -A app.worker beat --loglevel=info
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - attachments:/app/data/attachments
+      - agent_knowledge:/app/data/agent_knowledge
+      - agent_embedding_models:/app/data/embedding_models
+    restart: unless-stopped
+
+# Volumes persistants
+volumes:
+  pgdata:
+  attachments:
+  agent_knowledge:
+  agent_embedding_models:
