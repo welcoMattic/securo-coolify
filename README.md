@@ -102,3 +102,7 @@ Les données suivantes sont stockées dans des volumes Docker persistants :
 | `agent_embedding_models` | Modèles d'embedding pour les agents IA |
 
 Ces volumes sont conservés entre les redéploiements. Pour une sauvegarde complète, sauvegardez ces volumes avant une migration ou une suppression du service.
+
+## Sponsors
+
+Si ce projet vous est utile, vous pouvez soutenir mon travail open source sur [GitHub Sponsors](https://github.com/sponsors/welcoMattic). Les paliers et ce qu'ils financent : [blog.welcomattic.com/sponsors](https://blog.welcomattic.com/sponsors/). À partir du palier Company (100 $ par mois), votre logo et un lien apparaissent ici.
